@@ -1,0 +1,34 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Compliance Bancaria Analyzer — requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Core app
+streamlit>=1.35.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.26.0
+openpyxl>=3.1.0          # export Excel
+
+# PDF parsing (testo selezionabile)
+pdfplumber>=0.10.0
+
+# OCR — per PDF con font proprietari (es. Intesa Sanpaolo)
+pymupdf>=1.24.0           # import fitz
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NOTA: pytesseract richiede Tesseract installato nel sistema operativo.
+#
+# Su Linux/Ubuntu (es. server Streamlit Cloud, VPS, Docker):
+#   apt-get install -y tesseract-ocr tesseract-ocr-ita
+#
+# Su macOS:
+#   brew install tesseract
+#   brew install tesseract-lang   # per l'italiano
+#
+# Su Windows:
+#   scaricare l'installer da https://github.com/UB-Mannheim/tesseract/wiki
+#   aggiungere il percorso a PATH
+# ─────────────────────────────────────────────────────────────────────────────
