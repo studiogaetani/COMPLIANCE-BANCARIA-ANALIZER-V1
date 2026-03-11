@@ -21,6 +21,15 @@ try:
 except ImportError:
     PDF_AVAILABLE = False
 
+# OCR support (per estratti conto con font proprietari)
+try:
+    import fitz  # pymupdf
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIG PAGINA
 # ─────────────────────────────────────────────────────────────────────────────
@@ -241,72 +250,172 @@ def parse_corrispettivi_pdf(file_bytes: bytes) -> pd.DataFrame | None:
     return df if not df.empty else None
 
 
+def _ocr_page(page_obj) -> list:
+    """
+    Esegue OCR su una pagina PyMuPDF e ritorna lista di dict
+    {text, x, y, w, h} per ogni parola riconosciuta.
+    DPI 220 per buon bilanciamento velocità/accuratezza.
+    """
+    mat = fitz.Matrix(220 / 72, 220 / 72)
+    pix = page_obj.get_pixmap(matrix=mat)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    data = pytesseract.image_to_data(
+        img, lang="ita", output_type=pytesseract.Output.DICT,
+        config="--psm 6"
+    )
+    words = []
+    for i, txt in enumerate(data["text"]):
+        if str(txt).strip():
+            words.append({
+                "text": str(txt).strip(),
+                "x":    data["left"][i],
+                "y":    data["top"][i],
+                "w":    data["width"][i],
+                "h":    data["height"][i],
+            })
+    return words, img.width
+
+
 def parse_banca_intesa_pdf(file_bytes: bytes) -> pd.DataFrame | None:
     """
-    Parser per estratto conto Banca Intesa Sanpaolo.
-    Layout colonne (coordinate X):
-      - x=23-94:   Data operazione (DD.MM.YYYY) + Data valuta (fuse)
-      - x=150-380: Descrizione
-      - x=380-453: Addebiti (uscite)
-      - x=453+:    Accrediti (entrate)
-    NOTA: Q1-Q3 2025 usano un font speciale — importi non estraibili come testo.
+    Parser per estratto conto Banca Intesa Sanpaolo con OCR.
+
+    Il PDF usa un font proprietario con encoding custom (PUA Unicode \ue0xx),
+    quindi pdfplumber non può estrarre testo leggibile. Si usa OCR via
+    PyMuPDF + Tesseract per convertire ogni pagina in immagine e leggere il testo.
+
+    Layout colonne (coordinate X in pixel a 220 DPI su pagina A4):
+      - x ≈   0-220:  Data operazione  (DD.MM.YYYY)
+      - x ≈ 220-400:  Data valuta
+      - x ≈ 400-1100: Descrizione
+      - x ≈ 1050-1280: Addebiti (uscite)
+      - x ≈ 1280+:    Accrediti (entrate)
+    Il confine addebit/accrediti viene calcolato dinamicamente
+    trovando la posizione delle intestazioni di colonna.
     """
-    if not PDF_AVAILABLE:
-        st.error("❌ pdfplumber non installato.")
+    if not OCR_AVAILABLE:
+        st.error(
+            "❌ OCR non disponibile. Installare: pymupdf, pytesseract, pillow "
+            "e tesseract-ocr (con lingua italiana)."
+        )
         return None
 
-    DATE_RE = re.compile(r"^(\d{2}\.\d{2}\.\d{4})(\d{2}\.\d{2}\.\d{4})")
-    AMT_RE  = re.compile(r"^\d{1,3}(?:\.\d{3})*,\d{2}$")
-    X_ADD, X_ACC = 380, 453
+    DATE_RE = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+    AMT_RE  = re.compile(r"^\+?\-?\d{1,3}(?:\.\d{3})*,\d{2}$")
     rows = []
 
     try:
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                chars = page.chars
-                if not chars:
-                    continue
-                by_y = {}
-                for c in chars:
-                    y = round(c["top"])
-                    by_y.setdefault(y, []).append(c)
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        total_pages = len(doc)
 
-                for y, row_chars in sorted(by_y.items()):
-                    cs = sorted(row_chars, key=lambda c: c["x0"])
-                    line = "".join(c["text"] for c in cs)
-                    m = DATE_RE.match(line)
-                    if not m:
-                        continue
+        # Progress bar Streamlit
+        prog = st.progress(0, text="OCR in corso…")
 
-                    data_op = m.group(1)
+        for page_idx in range(total_pages):
+            prog.progress(
+                int((page_idx + 1) / total_pages * 100),
+                text=f"OCR pagina {page_idx + 1}/{total_pages}…"
+            )
+            page_obj = doc[page_idx]
+            words, page_w = _ocr_page(page_obj)
+            if not words:
+                continue
 
-                    # Description: ALL chars in x range 150-380 (includes space chars)
-                    descr_chars = [c for c in cs if 150 <= c["x0"] < X_ADD and c["text"] != "*"]
-                    descrizione = "".join(c["text"] for c in descr_chars).strip()
+            # ── Trova colonne addebiti/accrediti dal testo header ──────────
+            x_split = int(page_w * 0.75)  # default split ~75% larghezza
+            for w in words:
+                if "addebiti" in w["text"].lower():
+                    x_split = w["x"] + w["w"] + int(page_w * 0.08)
+                    break
 
-                    def to_amt(clist):
-                        text = "".join(c["text"] for c in clist
-                                       if c["text"] not in ("\u2007", " ", "\u00a0")).strip()
-                        return _parse_amt_it(text) if AMT_RE.match(text) else 0.0
+            # ── Raggruppa parole per riga (y con tolleranza 8 px) ──────────
+            rows_by_y: dict[int, list] = {}
+            for w in words:
+                y_key = round(w["y"] / 8) * 8
+                rows_by_y.setdefault(y_key, []).append(w)
 
-                    add = to_amt([c for c in cs if X_ADD <= c["x0"] < X_ACC])
-                    acc = to_amt([c for c in cs if c["x0"] >= X_ACC])
+            # ── Scansiona righe cercando transazioni ───────────────────────
+            sorted_ys = sorted(rows_by_y.keys())
+            current_txn: dict | None = None
 
-                    rows.append({
+            def flush_txn():
+                if current_txn and (current_txn["entrata"] > 0 or current_txn["uscita"] > 0):
+                    rows.append(current_txn.copy())
+
+            for y in sorted_ys:
+                line_words = sorted(rows_by_y[y], key=lambda w: w["x"])
+                first = line_words[0]["text"]
+
+                if DATE_RE.match(first):
+                    # Salva transazione precedente
+                    flush_txn()
+
+                    # Cerca seconda data (valuta)
+                    date_words = [w for w in line_words if DATE_RE.match(w["text"])]
+                    data_op = date_words[0]["text"] if date_words else first
+
+                    # Descrizione: parole nel range x 400..x_split-120
+                    descr_words = [w["text"] for w in line_words
+                                   if w["x"] > 380 and w["x"] < (x_split - 80)
+                                   and not DATE_RE.match(w["text"])]
+                    descrizione = " ".join(descr_words)
+
+                    # Importi
+                    amt_words = [w for w in line_words
+                                 if AMT_RE.match(w["text"].lstrip("+-"))]
+                    uscita = entrata = 0.0
+                    for aw in amt_words:
+                        v = _parse_amt_it(aw["text"].lstrip("+-"))
+                        if aw["x"] < x_split:
+                            uscita = v
+                        else:
+                            entrata = v
+
+                    current_txn = {
                         "data": data_op,
                         "descrizione": descrizione,
-                        "entrata": acc,
-                        "uscita": add,
-                        "_importo_leggibile": not (add == 0 and acc == 0),
-                    })
+                        "entrata": entrata,
+                        "uscita": uscita,
+                        "_importo_leggibile": True,
+                    }
+                elif current_txn is not None:
+                    # Riga di continuazione descrizione (no nuova data)
+                    # Aggiungi parole di testo alla descrizione corrente
+                    extra_words = [w["text"] for w in line_words
+                                   if w["x"] > 380 and w["x"] < (x_split - 80)
+                                   and not DATE_RE.match(w["text"])
+                                   and not AMT_RE.match(w["text"].lstrip("+-"))]
+                    # Attenzione: se ci sono importi in questa riga di continuazione,
+                    # potrebbero essere il valore dell'importo su riga separata
+                    amt_continuation = [w for w in line_words
+                                        if AMT_RE.match(w["text"].lstrip("+-"))]
+                    if amt_continuation and current_txn["entrata"] == 0 and current_txn["uscita"] == 0:
+                        for aw in amt_continuation:
+                            v = _parse_amt_it(aw["text"].lstrip("+-"))
+                            if aw["x"] < x_split:
+                                current_txn["uscita"] = v
+                            else:
+                                current_txn["entrata"] = v
+                    if extra_words:
+                        current_txn["descrizione"] = (
+                            current_txn["descrizione"] + " " + " ".join(extra_words)
+                        ).strip()
+
+            flush_txn()
+        prog.empty()
+        doc.close()
+
     except Exception as e:
-        st.error(f"Errore lettura PDF banca: {e}")
+        st.error(f"Errore OCR PDF banca: {e}")
         return None
 
     if not rows:
+        st.warning("⚠️ Nessun movimento trovato nell'estratto conto. "
+                   "Verificare che il PDF contenga la sezione 'Dettaglio movimenti'.")
         return None
+
     df = pd.DataFrame(rows)
-    # Keep all rows - show warning for those without amounts
+    df = df[(df["entrata"] > 0) | (df["uscita"] > 0)].reset_index(drop=True)
     return df if not df.empty else None
 
 
@@ -316,11 +425,22 @@ def carica_pdf_automatico(file_bytes: bytes, filename: str) -> tuple:
     e chiama il parser appropriato.
     Ritorna (tipo, DataFrame) dove tipo è 'banca' o 'corr'.
     """
-    # Heuristic: check for "CORRISPETTIVI" in first page text
+    # Prima prova OCR per capire il tipo (testo leggibile anche con font custom)
     try:
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            first_text = pdf.pages[0].extract_text() or ""
-        if "CORRISPETTIVI" in first_text.upper() or "IMPONIBILE" in first_text.upper():
+        if OCR_AVAILABLE:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+            mat = fitz.Matrix(100 / 72, 100 / 72)
+            pix = doc[0].get_pixmap(matrix=mat)
+            img = Image.open(io.BytesIO(pix.tobytes("png")))
+            first_text = pytesseract.image_to_string(img, lang="ita").upper()
+            doc.close()
+        elif PDF_AVAILABLE:
+            with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+                first_text = (pdf.pages[0].extract_text() or "").upper()
+        else:
+            return "unknown", None
+
+        if "CORRISPETTIVI" in first_text or "IMPONIBILE" in first_text:
             return "corr", parse_corrispettivi_pdf(file_bytes)
         else:
             return "banca", parse_banca_intesa_pdf(file_bytes)
